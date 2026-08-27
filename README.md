@@ -22,17 +22,17 @@ controller.
 
 This bouncer takes a structurally narrower approach: it never creates, edits, or
 reorders a firewall *policy*, not even once, not even at startup — only ever
-reads/writes one firewall *group*'s membership list, which is cheap regardless of how
-often it changes. The one-time policy setup covered below (including its own one-time
-reorder step, done by hand) is deliberately the only place a policy ever gets touched —
-never repeated by this code, for as long as it runs.
+reads/writes firewall *group* membership, which is cheap regardless of how often it
+changes. The one-time policy setup covered below (including its own one-time reorder
+step, done by hand) is deliberately the only place a policy ever gets touched — never
+repeated by this code, for as long as it runs.
 
 ## Before you install: read this
 
-**This bouncer only ever manages one UniFi firewall *group*'s membership. It never
-creates, edits, or reorders a firewall *policy*.** A group is just a named list of IP
+**This bouncer only ever manages UniFi firewall *group* membership. It never creates,
+edits, or reorders a firewall *policy*.** A group is just a named list of IP
 addresses — it blocks nothing by itself. A policy is the actual rule that says "traffic
-matching this group gets dropped." Without a policy referencing the group, the bouncer
+matching this group gets dropped." Without a policy referencing a group, the bouncer
 will run, sync CrowdSec's decisions, log `Synced firewall group -> N members`, and
 appear to work perfectly — while doing **nothing** to real traffic.
 
@@ -97,7 +97,7 @@ services:
 ```
 
 **Start with `DRY_RUN=true`.** In this mode the bouncer connects, reconciles, and logs
-exactly what it *would* do — including what it would name/create the group as — without
+exactly what it *would* do — including what it would name/create groups as — without
 writing anything to UniFi. Confirm the logs look sane (real decision counts, no
 connection errors) before going further.
 
@@ -111,9 +111,11 @@ Full environment variable reference:
 | `UNIFI_HOST` | *(required)* | Your UniFi controller's URL, e.g. `https://192.168.1.1` |
 | `UNIFI_API_KEY_FILE` | *(required)* | Path to the UniFi API key from step 2 |
 | `UNIFI_SITE` | `default` | UniFi site name |
-| `UNIFI_GROUP_NAME` | `crowdsec-banned-ips` | Name of the firewall group this bouncer creates/manages |
+| `UNIFI_GROUP_NAME` | `crowdsec-banned-ips` | Name of the IPv4 firewall group this bouncer creates/manages |
+| `UNIFI_GROUP_NAME_V6` | *(unset)* | Optional — name of a second, independent IPv6 firewall group (`ipv6-address-group`). Empty/unset disables IPv6 support entirely: IPv6 decisions are skipped, not attempted against a group that doesn't exist. Set this to enable it — see step 4 for the one-time policy setup this also needs |
 | `UNIFI_VERIFY_TLS` | `false` | UDM Pro's default cert is self-signed |
-| `UNIFI_POLICY_ID` | *(unset)* | Optional — once you've created the policy (step 4), set its `_id` here to get a `crowdsec_unifi_bouncer_policy_hits` metric, the one signal that proves real enforcement, not just group membership |
+| `UNIFI_POLICY_ID` | *(unset)* | Optional — once you've created the IPv4 policy (step 4), set its `_id` here to get a `crowdsec_unifi_bouncer_policy_hits` metric, the one signal that proves real enforcement, not just group membership |
+| `UNIFI_POLICY_ID_V6` | *(unset)* | Same as `UNIFI_POLICY_ID`, for the IPv6 policy — exposed as `crowdsec_unifi_bouncer_policy_hits_v6` |
 | `UNIFI_CLOUDFLARE_GROUP_NAME` | *(unset)* | Optional, unrelated to ban blocking — keeps a separate, already-existing UniFi group in sync with Cloudflare's published IP ranges, for WAN-restriction policies. Leave unset unless you specifically want this |
 | `DRY_RUN` | `true` | Set `false` only after step 4 below is complete |
 | `POLL_INTERVAL_SECONDS` | `2` | How often to check CrowdSec for new/expired decisions |
@@ -121,22 +123,28 @@ Full environment variable reference:
 | `RECONCILE_INTERVAL_SECONDS` | `21600` (6h) | Full resync interval, self-healing against any missed incremental update |
 | `METRICS_PORT` | `9105` | Prometheus `/metrics` endpoint |
 
-### 4. Create the UniFi policy — the step that actually enables blocking
+### 4. Create the UniFi policy (or policies) — the step that actually enables blocking
+
+Repeat this whole section once for IPv4 (`UNIFI_GROUP_NAME`) and, if you've set
+`UNIFI_GROUP_NAME_V6`, a second time for IPv6 — they're two entirely independent
+group/policy pairs.
 
 **4a. Let the group get created for real.** Flip `DRY_RUN=false` and restart the
-container. On first run it will create the `UNIFI_GROUP_NAME` group for real (if it
-doesn't already exist) and log its ID:
+container. On first run it will create the group(s) for real (if they don't already
+exist) and log their IDs:
 
 ```
-Created firewall group 'crowdsec-banned-ips' (id=<the real group id>)
+Created IPv4 firewall group 'crowdsec-banned-ips' (id=<the real group id>)
+Created IPv6 firewall group 'crowdsec-banned-ips-v6' (id=<the real group id>)
 ```
 
-Copy that ID. The group is still empty of consequence at this point — it has no policy
-referencing it, so nothing is blocked yet. That's expected.
+Copy the ID(s). The group is still empty of consequence at this point — it has no
+policy referencing it, so nothing is blocked yet. That's expected.
 
 **4b. Create the policy**, referencing the group's real ID. This needs the v2
 zone-based-firewall API — not documented in UniFi's own public docs at all, determined
-through direct testing against a real controller:
+through direct testing against a real controller. Find your zone IDs first via
+`GET .../v2/api/site/<site>/firewall-zones` if you don't already know them:
 
 ```bash
 curl -k -X POST "https://<unifi-host>/proxy/network/v2/api/site/<site>/firewall-policies" \
@@ -146,30 +154,37 @@ curl -k -X POST "https://<unifi-host>/proxy/network/v2/api/site/<site>/firewall-
     "action": "BLOCK",
     "enabled": true,
     "name": "Block CrowdSec-banned IPs",
-    "source_zone_id": "<your WAN/External zone id>",
-    "destination_zone_id": "<your LAN/Internal zone id>",
+    "protocol": "all",
+    "ip_version": "BOTH",
+    "create_allow_respond": false,
+    "connection_state_type": "ALL",
+    "schedule": { "mode": "ALWAYS" },
     "source": {
+      "zone_id": "<your WAN/External zone id>",
       "matching_target": "IP",
       "matching_target_type": "OBJECT",
       "ip_group_id": "<the group id from 4a>"
     },
     "destination": {
+      "zone_id": "<your LAN/Internal zone id>",
       "matching_target": "ANY"
     }
   }'
 ```
 
-Find your zone IDs via `GET .../v2/api/site/<site>/firewall-zones` first if you don't
-already know them. **Do not** set `create_allow_respond: true` on a `BLOCK` policy —
-that field is meant for `ALLOW` policies (it auto-creates a companion return-traffic
-rule) and UniFi will reject a `BLOCK` policy that has it
+Note the zone IDs are nested inside `source`/`destination` as `zone_id`, not top-level
+fields — confirmed by reading back a real, working policy's exact stored shape. **Do
+not** set `create_allow_respond: true` on a `BLOCK` policy — that field is meant for
+`ALLOW` policies (it auto-creates a companion return-traffic rule) and UniFi will
+reject a `BLOCK` policy that has it
 (`api.err.FirewallPolicyCreateRespondTrafficPolicyNotAllowed`).
 
 The response includes the new policy's own `_id` — save it too, for step 4c and for
-`UNIFI_POLICY_ID` above.
+`UNIFI_POLICY_ID`/`UNIFI_POLICY_ID_V6` above.
 
 **4c. Reorder the policy ahead of UniFi's predefined rules. This step is required, not
-optional** — see the warning at the top of this README for why:
+optional** — see the warning at the top of this README for why. This is a *different*
+endpoint with its own top-level shape (unlike 4b above, these zone IDs are NOT nested):
 
 ```bash
 curl -k -X PUT "https://<unifi-host>/proxy/network/v2/api/site/<site>/firewall-policies/batch-reorder" \
@@ -184,32 +199,34 @@ curl -k -X PUT "https://<unifi-host>/proxy/network/v2/api/site/<site>/firewall-p
 
 ### 5. Verify it's actually working
 
-Group membership syncing correctly is not proof the policy is enforcing anything — the
-reference deployment's own policy sat at 0 hits for hours even while the group was
+Group membership syncing correctly is not proof a policy is enforcing anything — the
+reference deployment's own IPv4 policy sat at 0 hits for hours even while the group was
 correctly populated, simply because no banned IP had retried yet in that window. Two
-real checks:
+real checks, per policy:
 
 - `GET .../v2/api/site/<site>/firewall-policies/<policy id>` — its `hits` field
   (absent entirely until the first match, not present as `0`) increments only on a real
   match. If you have other policies on the same zone pair with real traffic, watching
   *their* hit counts grow confirms the zone pair itself is being evaluated at all, which
   helps distinguish "no banned IP has retried yet" from "the policy isn't wired up."
-- If `UNIFI_POLICY_ID` is set, the bouncer exposes this as
-  `crowdsec_unifi_bouncer_policy_hits` on its own metrics endpoint — the single metric
-  that proves real router-level enforcement, not just group membership.
+- If `UNIFI_POLICY_ID`/`UNIFI_POLICY_ID_V6` is set, the bouncer exposes this as
+  `crowdsec_unifi_bouncer_policy_hits`/`_v6` on its own metrics endpoint — the single
+  metric that proves real router-level enforcement, not just group membership.
 
 ## Known limitations
 
-- **IPv4 only.** UniFi's classic REST API `address-group` firewall-group type rejects
-  IPv6 decisions outright. IPv6-sourced CrowdSec decisions are logged and skipped, not
-  crash-looped on.
 - **Single UniFi site.** `UNIFI_SITE` is one value; multi-site controllers aren't
   supported.
-- **No automated test suite.** This is a single flat script, validated by live testing
-  against a real controller, not mocked unit tests.
+- **No automated test suite.** This is validated by live testing against a real
+  controller and a local test harness with stubbed dependencies, not a full mocked
+  unit-test suite shipped with the repo.
 - **The UniFi API key needs broad access.** There's no confirmed way to scope a UniFi
   API credential down to firewall-group-only access on the classic REST API — this
   bouncer likely holds more access than it strictly needs.
+- **Range-scoped Cloudflare exclusion.** The Cloudflare-safety-check (never block a
+  Cloudflare-owned address) only checks plain IPs, not CIDR-range-scoped decisions —
+  every decision observed against the reference deployment so far has been IP-scoped,
+  not range-scoped.
 
 ## Security notes
 
