@@ -60,7 +60,17 @@ UNIFI_POLICY_ID = os.environ.get("UNIFI_POLICY_ID", "")
 UNIFI_CLOUDFLARE_GROUP_NAME = os.environ.get("UNIFI_CLOUDFLARE_GROUP_NAME", "")
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
-POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
+# 2026-08-27: lowered from 60s. Researched whether CrowdSec's official Go bouncer SDK
+# (csbouncer.StreamBouncer, the thing "real streaming" in the roadmap referred to)
+# does genuine server-push -- it doesn't. It's the identical /v1/decisions/stream HTTP
+# poll this file already does, on a configurable TickerInterval that itself defaults
+# to 60s (confirmed against go-cs-bouncer's own docs). There is no push/SSE/WebSocket
+# transport for local decisions in the open-source LAPI -- "streaming" is just this
+# poll-loop's name. So the only real lever is a shorter interval, which is free here:
+# UniFi is still only ever written to when the ban set actually changed (pending_write
+# gate, unchanged) -- polling more often does not multiply UniFi writes in normal
+# operation, only how quickly a real change gets noticed and pushed.
+POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "2"))
 API_WRITE_DELAY_SECONDS = float(os.environ.get("API_WRITE_DELAY_SECONDS", "1.0"))
 # How often to redo a *full* reconciliation (fetch CrowdSec's complete current decision
 # list and recompute the desired ban set from scratch) rather than relying solely on
