@@ -215,6 +215,16 @@ real checks, per policy:
 
 ## Known limitations
 
+- **IPv6 support only helps if your WAN itself can receive IPv6 packets.** Check your
+  own router's WAN configuration before enabling `UNIFI_GROUP_NAME_V6` expecting real
+  protection. If your ISP hasn't delegated you a public IPv6 address, no IPv6 packet
+  can physically reach your WAN interface at all, regardless of how much IPv6-sourced
+  client traffic your CDN/proxy reports seeing — a CDN in front of an IPv4-only origin
+  always reconnects to that origin over IPv4, no matter what protocol the original
+  visitor used. In that case the IPv6 group/policy is harmless to leave enabled, but it
+  will never match a real packet at the router. Found the hard way: built and deployed
+  IPv6 support against a real homelab whose WAN turned out to have no IPv6 delegation
+  at all, discovered only after rollout.
 - **Single UniFi site.** `UNIFI_SITE` is one value; multi-site controllers aren't
   supported.
 - **No automated test suite.** This is validated by live testing against a real
