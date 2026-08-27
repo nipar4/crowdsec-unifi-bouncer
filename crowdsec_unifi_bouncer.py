@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """CrowdSec -> UniFi firewall-group bouncer.
 
-Custom-built 2026-08-13 after evaluating two existing third-party bouncers (see
-crowdsec-unifi-bouncer-plan.md at the repo root for the full research and design
-history) -- neither was clean enough to just adopt (one was previously deployed here
-and abandoned after it consumed all CPU on the UniFi controller; both have real
-provenance/validation concerns).
-
 Design deliberately never touches UniFi firewall *policies* -- only ever reads/writes
-one firewall *group*'s membership list. The one-time zone-based policy referencing
-this group must be created by hand in the UniFi UI (Phase 5 of the plan doc). This is
-the key lesson taken from analysing the real source of the tool that caused the prior
-CPU-exhaustion incident: it reordered the entire zone-based policy set on nearly every
-ban-list change, a known-expensive whole-ruleset operation. Never reordering or
-recreating a policy at all -- not even once, not even at startup -- structurally
-prevents that class of bug from ever being reintroduced here.
+firewall *group* membership. The one-time zone-based policy referencing each group must
+be created by hand in the UniFi UI/API (see README). This is the key lesson taken from
+analysing the real source of a tool that caused a prior CPU-exhaustion incident: it
+reordered the entire zone-based policy set on nearly every ban-list change, a
+known-expensive whole-ruleset operation. Never reordering or recreating a policy at all
+-- not even once, not even at startup -- structurally prevents that class of bug from
+ever being reintroduced here.
+
+IPv6 support (2026-08-27): a second, independent group/policy pair, opt-in via
+UNIFI_GROUP_NAME_V6. Decisions are classified by address family and routed to whichever
+group matches; each family's group is synced independently. See
+crowdsec-unifi-bouncer-plan.md's "Phase 6" for the full scoping history.
 """
 
 import logging
@@ -49,6 +48,18 @@ UNIFI_VERIFY_TLS = os.environ.get("UNIFI_VERIFY_TLS", "false").lower() == "true"
 # reorder/delete), this is a single GET on a known, fixed policy that already exists.
 # Unset/empty skips this metric entirely (e.g. before the one-time policy exists yet).
 UNIFI_POLICY_ID = os.environ.get("UNIFI_POLICY_ID", "")
+# IPv6 support, opt-in (2026-08-27, Phase 6). Empty/unset disables it entirely -- v6
+# decisions are then skipped exactly like before this feature existed, not attempted
+# against a group that doesn't exist. When set, this bouncer will create (if missing)
+# and maintain a *second*, independent ipv6-address-group with this name -- same
+# lazy-create-on-first-run behavior UNIFI_GROUP_NAME already has, proven safe in
+# production since the group itself is harmless without a policy referencing it. The
+# one-time zone policy for this group still has to be created by hand, same as the v4
+# one -- that part of the design never changes for either family. UNIFI_POLICY_ID_V6
+# is the same optional hit-count metric as UNIFI_POLICY_ID, for that second policy.
+UNIFI_GROUP_NAME_V6 = os.environ.get("UNIFI_GROUP_NAME_V6", "")
+UNIFI_POLICY_ID_V6 = os.environ.get("UNIFI_POLICY_ID_V6", "")
+IPV6_ENABLED = bool(UNIFI_GROUP_NAME_V6)
 # Optional -- name of a UniFi address-group to keep in sync with Cloudflare's real
 # published IPv4 ranges (e.g. "cloudflare-ips-v4", the group backing the separate
 # WAN-restriction policies added 2026-08-13, see improvement-plan.md's Priority 0
@@ -93,21 +104,31 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("crowdsec-unifi-bouncer")
 
 # Scoped to what this bouncer actually needs to answer "is it working, and did the
-# last change take effect" from Grafana -- not cs-unifi-bouncer-pro's full metric
-# surface (per-scenario labels, shard counts, etc.), matching this build's overall
-# "small, fully-understood" scope decision (see crowdsec-unifi-bouncer-plan.md).
+# last change take effect" from Grafana -- not a full metric surface (per-scenario
+# labels, shard counts, etc.), matching this build's overall "small, fully-understood"
+# scope decision (see crowdsec-unifi-bouncer-plan.md).
+#
+# v6 gets its own PARALLEL, distinctly-named gauges (not a `family` label on the
+# existing ones) for the state metrics an existing Grafana dashboard already queries by
+# exact name -- adding a label there would silently change what those panels show.
+# Counters (decisions/writes) stay shared/unified across families; they're generic
+# outcome tallies already, not tied to a single group's identity the way the gauges are.
 METRIC_DECISIONS_TOTAL = Counter(
     "crowdsec_unifi_bouncer_decisions_total", "CrowdSec decisions actually acted on", ["result"])
 METRIC_DECISIONS_SKIPPED_TOTAL = Counter(
     "crowdsec_unifi_bouncer_decisions_skipped_total", "CrowdSec decisions filtered out", ["reason"])
 METRIC_BANNED_ADDRESSES = Gauge(
     "crowdsec_unifi_bouncer_banned_addresses", "Current size of the UniFi block group")
+METRIC_BANNED_ADDRESSES_V6 = Gauge(
+    "crowdsec_unifi_bouncer_banned_addresses_v6", "Current size of the UniFi IPv6 block group -- only meaningful if UNIFI_GROUP_NAME_V6 is configured")
 METRIC_UNIFI_WRITE_TOTAL = Counter(
     "crowdsec_unifi_bouncer_unifi_write_total", "UniFi group-membership write attempts", ["result"])
 METRIC_LAST_SYNC_TIMESTAMP = Gauge(
     "crowdsec_unifi_bouncer_last_sync_timestamp_seconds", "Unix time of the last successful CrowdSec poll")
 METRIC_LAST_WRITE_TIMESTAMP = Gauge(
     "crowdsec_unifi_bouncer_last_write_timestamp_seconds", "Unix time of the last successful UniFi group write")
+METRIC_LAST_WRITE_TIMESTAMP_V6 = Gauge(
+    "crowdsec_unifi_bouncer_last_write_timestamp_v6_seconds", "Unix time of the last successful UniFi IPv6 group write -- only meaningful if UNIFI_GROUP_NAME_V6 is configured")
 METRIC_DRY_RUN = Gauge(
     "crowdsec_unifi_bouncer_dry_run", "1 if running in dry-run mode (no real writes), else 0")
 METRIC_CLOUDFLARE_RANGES = Gauge(
@@ -115,6 +136,9 @@ METRIC_CLOUDFLARE_RANGES = Gauge(
 METRIC_POLICY_HITS = Gauge(
     "crowdsec_unifi_bouncer_policy_hits",
     "Cumulative match count on the enforcement policy (real router-level enforcement evidence, not just group membership) -- only set if UNIFI_POLICY_ID is configured")
+METRIC_POLICY_HITS_V6 = Gauge(
+    "crowdsec_unifi_bouncer_policy_hits_v6",
+    "Same as crowdsec_unifi_bouncer_policy_hits, for the IPv6 policy -- only set if UNIFI_POLICY_ID_V6 is configured")
 METRIC_CLOUDFLARE_GROUP_SYNC_TOTAL = Counter(
     "crowdsec_unifi_bouncer_cloudflare_group_sync_total",
     "UniFi Cloudflare-IP-group write attempts -- only used if UNIFI_CLOUDFLARE_GROUP_NAME is configured", ["result"])
@@ -129,7 +153,9 @@ class CloudflareAllowlist:
     """Fetches and caches Cloudflare's real IP ranges. Never let a CrowdSec decision
     against a Cloudflare-owned address reach the block list, regardless of what
     CrowdSec reports -- defense-in-depth against a header-trust misconfiguration ever
-    causing this bouncer to block Cloudflare's own infrastructure.
+    causing this bouncer to block Cloudflare's own infrastructure. Already dual-stack:
+    fetches both the IPv4 and IPv6 published ranges into the same pool, and `contains()`
+    checks membership regardless of the address's own version.
     """
 
     def __init__(self):
@@ -231,21 +257,17 @@ class UniFiClient:
                 return g
         return None
 
-    def create_group(self, name):
-        # NOTE: not yet live-verified -- the exact required field set/group_type value
-        # for this controller's firmware version needs confirming during Phase 4's
-        # dry-run (this call is skipped entirely in dry-run mode). Deliberately does
-        # not touch anything policy-related.
-        body = {"name": name, "group_type": "address-group", "group_members": []}
+    def create_group(self, name, group_type="address-group"):
+        # group_type live-verified 2026-08-27 against the real controller for both
+        # values this bouncer uses: "address-group" (v4, Phase 4) and
+        # "ipv6-address-group" (v6, Phase 6) -- both accept a bare address for a single
+        # host (see normalize_member below) and a real CIDR for a range.
+        body = {"name": name, "group_type": group_type, "group_members": []}
         resp = self.session.post(self._url("rest/firewallgroup"), json=body, timeout=15)
         resp.raise_for_status()
         return resp.json()["data"][0]
 
     def update_group_members(self, group, members):
-        # NOTE: field name for the group's own ID was not confirmed live (no group
-        # existed yet to inspect during Phase 2's read-only check) -- handles either
-        # `_id` or `id`, whichever this controller's API actually returns. Confirm and
-        # simplify this once Phase 4 shows the real shape.
         group_id = group.get("_id") or group.get("id")
         body = dict(group)
         body["group_members"] = sorted(members)
@@ -257,11 +279,13 @@ class UniFiClient:
 
 
 def normalize_member(ip_str):
-    # Confirmed live 2026-08-13 (Phase 5): UniFi's classic REST API firewallgroup
-    # (address-group) rejects /32 CIDR notation for single hosts --
-    # api.err.FirewallGroupInvalidArgs, args echoing the rejected "<ip>/32" value.
-    # Bare IPs are what it wants for single-host entries; a real range-scoped decision
-    # (already containing a non-/32 mask) is passed through as-is.
+    # Confirmed live 2026-08-13 (Phase 5) for IPv4, and again 2026-08-27 (Phase 6) for
+    # IPv6: UniFi's classic REST API firewallgroup (both "address-group" and
+    # "ipv6-address-group") rejects a full-host-mask CIDR for single hosts --
+    # api.err.FirewallGroupInvalidArgs, args echoing the rejected value. Bare IPs are
+    # what it wants for single-host entries; a real range-scoped decision (already
+    # carrying a smaller mask) is passed through as-is. Already correctly generic --
+    # this function needed zero changes to support IPv6.
     if "/" in ip_str:
         prefix = ip_str.rsplit("/", 1)[1]
         addr = ip_address(ip_str.split("/")[0])
@@ -270,28 +294,23 @@ def normalize_member(ip_str):
     return ip_str
 
 
-def is_ipv4(ip_str):
-    # UniFi's "address-group" group_type is IPv4-only -- confirmed live 2026-08-13,
-    # rejected a bare IPv6 decision with the same api.err.FirewallGroupInvalidArgs.
-    # Properly supporting IPv6 needs a second, address-family-specific UniFi group plus
-    # a second zone policy referencing it -- out of scope for v1 (flagged as an open
-    # question back in Phase 3, confirmed to actually matter here: 1 of 13 real local
-    # decisions today was IPv6). Skip v6 decisions for now rather than crash the sync
-    # loop on every cycle.
+def ip_version(ip_str):
+    # Returns 4, 6, or None (unparseable -- e.g. a malformed value). Replaces the old
+    # is_ipv4() boolean check now that both families are potentially in scope.
     try:
-        return ip_address(ip_str.split("/")[0]).version == 4
+        return ip_address(ip_str.split("/")[0]).version
     except ValueError:
-        return False
+        return None
 
 
 def sync_cloudflare_group(unifi, cf_allow):
-    # Deliberately never creates the group -- only crowdsec-banned-ips gets that
-    # treatment (this bouncer's own group, created lazily on first live run).
-    # cloudflare-ips-v4 is a different, hand-created group backing separate
-    # WAN-restriction policies (improvement-plan.md's Priority 0 item); if it's
-    # missing, that's a real setup problem worth surfacing, not something to
-    # silently paper over by creating a differently-configured group under the
-    # same name.
+    # Deliberately never creates the group -- only crowdsec-banned-ips (and, if
+    # enabled, crowdsec-banned-ips-v6) get that treatment (this bouncer's own groups,
+    # created lazily on first live run). cloudflare-ips-v4 is a different, hand-created
+    # group backing separate WAN-restriction policies (improvement-plan.md's Priority 0
+    # item); if it's missing, that's a real setup problem worth surfacing, not
+    # something to silently paper over by creating a differently-configured group under
+    # the same name.
     if not UNIFI_CLOUDFLARE_GROUP_NAME:
         return
     desired = set(cf_allow.ipv4_cidrs())
@@ -327,27 +346,89 @@ def sync_cloudflare_group(unifi, cf_allow):
               UNIFI_CLOUDFLARE_GROUP_NAME, len(added), len(removed), len(desired))
 
 
-def update_policy_hits_metric(unifi):
+def update_policy_hits_metric(unifi, policy_id, metric):
     # Best-effort -- a failure here (e.g. the controller briefly unreachable) shouldn't
     # take down the bouncer's actual job of syncing bans. Silently does nothing if
-    # UNIFI_POLICY_ID isn't configured (e.g. before the one-time policy exists yet).
-    if not UNIFI_POLICY_ID:
+    # policy_id isn't configured (e.g. before the one-time policy exists yet).
+    # Generalized 2026-08-27 (was hardcoded to UNIFI_POLICY_ID/METRIC_POLICY_HITS) so
+    # the same function serves both the v4 and v6 policies.
+    if not policy_id:
         return
     try:
-        METRIC_POLICY_HITS.set(unifi.get_policy_hits(UNIFI_POLICY_ID))
+        metric.set(unifi.get_policy_hits(policy_id))
     except requests.RequestException as e:
         log.warning("Failed to fetch policy hit count: %s", e)
 
 
-def reconcile(cs, unifi, cf_allow, group, label):
+def _write_group(unifi, group, desired, group_name, metric_banned, metric_last_write):
+    """Write `desired` as the given group's new membership (unless DRY_RUN), updating
+    metrics. Used by the incremental loop, which already knows exactly what changed --
+    unlike reconcile()/_sync_group below, which computes the diff fresh, this doesn't
+    need to.
+    """
+    metric_banned.set(len(desired))
+    if DRY_RUN:
+        log.info("[dry-run] Would sync firewall group %r to %d members (no write performed)", group_name, len(desired))
+        return group
+    time.sleep(API_WRITE_DELAY_SECONDS)  # deliberate throttle before any UniFi write
+    try:
+        group = unifi.update_group_members(group, desired)
+    except requests.RequestException:
+        METRIC_UNIFI_WRITE_TOTAL.labels(result="failure").inc()
+        raise
+    METRIC_UNIFI_WRITE_TOTAL.labels(result="success").inc()
+    metric_last_write.set(time.time())
+    log.info("Synced firewall group %r -> %d members", group_name, len(desired))
+    return group
+
+
+def _sync_group(unifi, group, desired, group_name, label, metric_banned, metric_last_write):
+    """Diff `group`'s current membership against `desired`, log every addition/removal
+    for end-to-end traceability, then write if anything changed. Shared by reconcile()
+    for both address families -- the only difference between a v4 and v6 call is which
+    group/desired-set/group_name/metrics get passed in.
+    """
+    current = set(group.get("group_members", []))
+    added = desired - current
+    stale = current - desired
+    for member in added:
+        log.info("%s: reconciling CrowdSec ban %s into UniFi group %r", label, member, group_name)
+    for member in stale:
+        # Same explicit-naming principle as additions above -- a removal deserves the
+        # same end-to-end traceability as a ban does.
+        log.info("%s: removing %s from UniFi group %r -- no longer an active CrowdSec decision", label, member, group_name)
+
+    if desired != current:
+        group = _write_group(unifi, group, desired, group_name, metric_banned, metric_last_write)
+    else:
+        # No PUT needed since the group's already correct -- but that's still a real,
+        # just-confirmed data point on "is the UniFi group in the right state," which is
+        # what this metric is actually for. Without this, a cycle where nothing needed
+        # to change left the gauge at its Prometheus-default 0 until the next real
+        # write, making "time since last write" read as ~56 years (time() - 0) --
+        # confirmed live 2026-08-13, not a hypothetical.
+        metric_banned.set(len(desired))
+        metric_last_write.set(time.time())
+
+    log.info("%s reconciliation (%s): %d addresses should be blocked (%d already were, %d stale removed)",
+              label, group_name, len(desired), len(current), len(stale))
+    return group
+
+
+def reconcile(cs, unifi, cf_allow, group, group_v6, label):
     """Fetch CrowdSec's complete current decision list and recompute the desired ban
-    set from scratch -- NOT a union with whatever's already in the UniFi group. Used
-    both at process startup and periodically (RECONCILE_INTERVAL_SECONDS) so
-    correctness never depends solely on the ongoing loop's incremental deltas. Returns
-    the (possibly updated) group object and the freshly-computed banned set.
+    set(s) from scratch -- NOT a union with whatever's already in the UniFi group(s).
+    Used both at process startup and periodically (RECONCILE_INTERVAL_SECONDS) so
+    correctness never depends solely on the ongoing loop's incremental deltas.
+
+    Handles both address families in one pass over the same decision list (one
+    cs.decisions_stream() call, not two) -- `group_v6`/its returned banned set are
+    always empty/unused when IPv6 support is disabled (UNIFI_GROUP_NAME_V6 unset).
+    Returns (group, banned, group_v6, banned_v6).
     """
     already_banned = set(group.get("group_members", []))
     banned = set()
+    banned_v6 = set()
 
     initial = cs.decisions_stream(startup=True)
     METRIC_LAST_SYNC_TIMESTAMP.set(time.time())
@@ -359,62 +440,58 @@ def reconcile(cs, unifi, cf_allow, group, label):
             skipped_origin += 1
             continue
         ip = d["value"]
-        if not is_ipv4(ip):
+        version = ip_version(ip)
+        if version == 6 and not IPV6_ENABLED:
             skipped_v6 += 1
+            continue
+        if version not in (4, 6):
+            skipped_v6 += 1  # unparseable -- same skip path IPv6 used before this bouncer supported it
             continue
         if cf_allow.contains(ip):
             skipped_cf += 1
             continue
         member = normalize_member(ip)
-        if member not in already_banned:
-            log.info("%s: reconciling CrowdSec ban %s (%s, duration %s) into UniFi group",
-                      label, ip, d.get("scenario"), d.get("duration"))
-        banned.add(member)
+        (banned_v6 if version == 6 else banned).add(member)
     if skipped_origin:
         METRIC_DECISIONS_SKIPPED_TOTAL.labels(reason="origin").inc(skipped_origin)
         log.info("%s: skipped %d decision(s) outside CROWDSEC_ORIGINS=%s (e.g. shared community blocklists)",
                   label, skipped_origin, sorted(CROWDSEC_ORIGINS))
     if skipped_v6:
         METRIC_DECISIONS_SKIPPED_TOTAL.labels(reason="ipv6").inc(skipped_v6)
-        log.warning("%s: skipped %d non-IPv4 decision(s) -- IPv6 not yet supported (needs a separate UniFi group), see README", label, skipped_v6)
+        if IPV6_ENABLED:
+            log.warning("%s: skipped %d decision(s) with an unparseable address", label, skipped_v6)
+        else:
+            log.warning("%s: skipped %d IPv6 decision(s) -- IPv6 support not enabled (set UNIFI_GROUP_NAME_V6), see README", label, skipped_v6)
     if skipped_cf:
         METRIC_DECISIONS_SKIPPED_TOTAL.labels(reason="cloudflare").inc(skipped_cf)
         log.warning("%s: skipped %d decision(s) whose address falls within Cloudflare's own ranges", label, skipped_cf)
 
-    stale = already_banned - banned
-    for member in stale:
-        # Same explicit-naming principle as additions above -- a removal deserves the
-        # same end-to-end traceability as a ban does.
-        log.info("%s: removing %s from UniFi group -- no longer an active CrowdSec decision", label, member)
+    group = _sync_group(unifi, group, banned, UNIFI_GROUP_NAME, label, METRIC_BANNED_ADDRESSES, METRIC_LAST_WRITE_TIMESTAMP)
+    if IPV6_ENABLED:
+        group_v6 = _sync_group(unifi, group_v6, banned_v6, UNIFI_GROUP_NAME_V6, label, METRIC_BANNED_ADDRESSES_V6, METRIC_LAST_WRITE_TIMESTAMP_V6)
 
-    pending_write = banned != already_banned
-    METRIC_BANNED_ADDRESSES.set(len(banned))
-    if pending_write:
+    return group, banned, group_v6, banned_v6
+
+
+def _init_group(unifi, name, group_type, label):
+    """Find-or-create one UniFi firewall group, matching the historical v4 startup
+    behavior exactly (proven safe in production since 2026-08-13) -- now shared with
+    the v6 group too (Phase 6, 2026-08-27). The group itself is always safe to
+    auto-create: it's inert until a human creates the one-time policy referencing it
+    (see README), so there's nothing this code can get wrong here that a missing
+    policy wouldn't already make harmless.
+    """
+    group = unifi.find_group(name)
+    if group is None:
         if DRY_RUN:
-            log.info("[dry-run] Would sync firewall group %r to %d members (no write performed)",
-                      UNIFI_GROUP_NAME, len(banned))
-        else:
-            time.sleep(API_WRITE_DELAY_SECONDS)  # deliberate throttle before any UniFi write
-            try:
-                group = unifi.update_group_members(group, banned)
-            except requests.RequestException:
-                METRIC_UNIFI_WRITE_TOTAL.labels(result="failure").inc()
-                raise
-            METRIC_UNIFI_WRITE_TOTAL.labels(result="success").inc()
-            METRIC_LAST_WRITE_TIMESTAMP.set(time.time())
-            log.info("Synced firewall group %r -> %d members (%s)", UNIFI_GROUP_NAME, len(banned), label.lower())
+            log.info("[dry-run] Would create %s firewall group %r (no write performed)", label, name)
+            return {"_id": f"dry-run-placeholder-{label}", "name": name, "group_members": []}
+        group = unifi.create_group(name, group_type=group_type)
+        log.info("Created %s firewall group %r (id=%s)", label, name, group.get("_id") or group.get("id"))
     else:
-        # No PUT needed since the group's already correct -- but that's still a real,
-        # just-confirmed data point on "is the UniFi group in the right state," which is
-        # what this metric is actually for. Without this, a cycle where nothing needed
-        # to change left the gauge at its Prometheus-default 0 until the next real
-        # write, making "time since last write" read as ~56 years (time() - 0) --
-        # confirmed live 2026-08-13, not a hypothetical.
-        METRIC_LAST_WRITE_TIMESTAMP.set(time.time())
-
-    log.info("%s reconciliation: %d addresses should be blocked (%d already were, %d stale removed)",
-              label, len(banned), len(already_banned), len(stale))
-    return group, banned
+        log.info("Found existing %s firewall group %r (id=%s, %d current members)",
+                  label, name, group.get("_id") or group.get("id"), len(group.get("group_members", [])))
+    return group
 
 
 def main():
@@ -430,25 +507,18 @@ def main():
     if cf_allow.refresh(force=True):
         sync_cloudflare_group(unifi, cf_allow)
 
-    log.info("Starting crowdsec-unifi-bouncer (dry_run=%s, poll_interval=%ss, reconcile_interval=%ss, group=%r, cloudflare_group=%r, metrics_port=%d)",
+    log.info("Starting crowdsec-unifi-bouncer (dry_run=%s, poll_interval=%ss, reconcile_interval=%ss, group=%r, group_v6=%r, cloudflare_group=%r, metrics_port=%d)",
               DRY_RUN, POLL_INTERVAL_SECONDS, RECONCILE_INTERVAL_SECONDS, UNIFI_GROUP_NAME,
-              UNIFI_CLOUDFLARE_GROUP_NAME or "(disabled)", METRICS_PORT)
+              UNIFI_GROUP_NAME_V6 or "(disabled)", UNIFI_CLOUDFLARE_GROUP_NAME or "(disabled)", METRICS_PORT)
 
-    group = unifi.find_group(UNIFI_GROUP_NAME)
-    if group is None:
-        if DRY_RUN:
-            log.info("[dry-run] Would create firewall group %r (no write performed)", UNIFI_GROUP_NAME)
-            group = {"_id": "dry-run-placeholder", "name": UNIFI_GROUP_NAME, "group_members": []}
-        else:
-            group = unifi.create_group(UNIFI_GROUP_NAME)
-            log.info("Created firewall group %r (id=%s)", UNIFI_GROUP_NAME, group.get("_id") or group.get("id"))
-    else:
-        log.info("Found existing firewall group %r (id=%s, %d current members)",
-                  UNIFI_GROUP_NAME, group.get("_id") or group.get("id"), len(group.get("group_members", [])))
+    group = _init_group(unifi, UNIFI_GROUP_NAME, "address-group", "IPv4")
+    group_v6 = _init_group(unifi, UNIFI_GROUP_NAME_V6, "ipv6-address-group", "IPv6") if IPV6_ENABLED else None
 
-    update_policy_hits_metric(unifi)
+    update_policy_hits_metric(unifi, UNIFI_POLICY_ID, METRIC_POLICY_HITS)
+    if IPV6_ENABLED:
+        update_policy_hits_metric(unifi, UNIFI_POLICY_ID_V6, METRIC_POLICY_HITS_V6)
 
-    group, banned = reconcile(cs, unifi, cf_allow, group, label="Startup")
+    group, banned, group_v6, banned_v6 = reconcile(cs, unifi, cf_allow, group, group_v6, label="Startup")
     last_reconcile = time.time()
 
     while True:
@@ -459,11 +529,13 @@ def main():
                 # removal (e.g. natural TTL expiry, not just explicit `cscli`
                 # deletions -- never actually verified). Supersedes this cycle's
                 # incremental poll entirely rather than doing both.
-                group, banned = reconcile(cs, unifi, cf_allow, group, label="Periodic")
+                group, banned, group_v6, banned_v6 = reconcile(cs, unifi, cf_allow, group, group_v6, label="Periodic")
                 last_reconcile = time.time()
                 if cf_allow.refresh():
                     sync_cloudflare_group(unifi, cf_allow)
-                update_policy_hits_metric(unifi)
+                update_policy_hits_metric(unifi, UNIFI_POLICY_ID, METRIC_POLICY_HITS)
+                if IPV6_ENABLED:
+                    update_policy_hits_metric(unifi, UNIFI_POLICY_ID_V6, METRIC_POLICY_HITS_V6)
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
@@ -471,60 +543,62 @@ def main():
             METRIC_LAST_SYNC_TIMESTAMP.set(time.time())
             new = update.get("new") or []
             deleted = update.get("deleted") or []
-            # Refactored 2026-08-13 to share reconcile() with the periodic path above --
-            # this used to be seeded once before the loop by the old inline startup
-            # block, which no longer exists in this scope. Must default False each
-            # cycle, or a cycle with zero new/deleted decisions hits `if pending_write`
-            # below with the name never assigned.
+            # Must default False each cycle, or a cycle with zero new/deleted decisions
+            # hits `if pending_write` below with the name never assigned.
             pending_write = False
+            pending_write_v6 = False
 
             for d in new:
                 if d.get("origin") not in CROWDSEC_ORIGINS:
                     continue
                 ip = d["value"]
-                if not is_ipv4(ip):
+                version = ip_version(ip)
+                if version == 6 and not IPV6_ENABLED:
                     METRIC_DECISIONS_SKIPPED_TOTAL.labels(reason="ipv6").inc()
-                    log.warning("Skipping %s -- IPv6 not yet supported (needs a separate UniFi group), see README", ip)
+                    log.warning("Skipping %s -- IPv6 support not enabled (set UNIFI_GROUP_NAME_V6), see README", ip)
+                    continue
+                if version not in (4, 6):
+                    METRIC_DECISIONS_SKIPPED_TOTAL.labels(reason="ipv6").inc()
+                    log.warning("Skipping %s -- could not parse as an IP address", ip)
                     continue
                 if cf_allow.contains(ip):
                     METRIC_DECISIONS_SKIPPED_TOTAL.labels(reason="cloudflare").inc()
                     log.warning("Skipping %s -- within Cloudflare's own IP ranges, refusing to block", ip)
                     continue
                 member = normalize_member(ip)
-                if member not in banned:
-                    banned.add(member)
-                    pending_write = True
+                target = banned_v6 if version == 6 else banned
+                if member not in target:
+                    target.add(member)
+                    if version == 6:
+                        pending_write_v6 = True
+                    else:
+                        pending_write = True
                     METRIC_DECISIONS_TOTAL.labels(result="added").inc()
                     log.info("New decision: %s (%s, duration %s)", ip, d.get("scenario"), d.get("duration"))
             for d in deleted:
                 ip = d["value"]
                 member = normalize_member(ip)
-                if member in banned:
-                    banned.discard(member)
-                    pending_write = True
+                version = ip_version(ip)
+                target = banned_v6 if version == 6 else banned
+                if member in target:
+                    target.discard(member)
+                    if version == 6:
+                        pending_write_v6 = True
+                    else:
+                        pending_write = True
                     METRIC_DECISIONS_TOTAL.labels(result="removed").inc()
                     log.info("Expired decision, unblocking: %s", ip)
 
             if pending_write:
-                if DRY_RUN:
-                    log.info("[dry-run] Would sync firewall group %r to %d members (no write performed)",
-                              UNIFI_GROUP_NAME, len(banned))
-                else:
-                    time.sleep(API_WRITE_DELAY_SECONDS)  # deliberate throttle before any UniFi write
-                    try:
-                        group = unifi.update_group_members(group, banned)
-                    except requests.RequestException:
-                        METRIC_UNIFI_WRITE_TOTAL.labels(result="failure").inc()
-                        raise
-                    METRIC_UNIFI_WRITE_TOTAL.labels(result="success").inc()
-                    METRIC_LAST_WRITE_TIMESTAMP.set(time.time())
-                    log.info("Synced firewall group %r -> %d members", UNIFI_GROUP_NAME, len(banned))
-                pending_write = False
-                METRIC_BANNED_ADDRESSES.set(len(banned))
+                group = _write_group(unifi, group, banned, UNIFI_GROUP_NAME, METRIC_BANNED_ADDRESSES, METRIC_LAST_WRITE_TIMESTAMP)
+            if pending_write_v6:
+                group_v6 = _write_group(unifi, group_v6, banned_v6, UNIFI_GROUP_NAME_V6, METRIC_BANNED_ADDRESSES_V6, METRIC_LAST_WRITE_TIMESTAMP_V6)
 
             if cf_allow.refresh():
                 sync_cloudflare_group(unifi, cf_allow)
-            update_policy_hits_metric(unifi)
+            update_policy_hits_metric(unifi, UNIFI_POLICY_ID, METRIC_POLICY_HITS)
+            if IPV6_ENABLED:
+                update_policy_hits_metric(unifi, UNIFI_POLICY_ID_V6, METRIC_POLICY_HITS_V6)
 
         except requests.RequestException as e:
             log.error("Error during sync cycle: %s -- will retry next interval", e)
