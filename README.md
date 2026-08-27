@@ -4,17 +4,28 @@ A small, self-authored [CrowdSec](https://www.crowdsec.net/) bouncer that syncs
 CrowdSec's local decisions to a UniFi (UDM Pro) firewall address group, blocking banned
 IPs at the router edge instead of only at individual reverse-proxied services.
 
-Built after evaluating two existing third-party bouncers (`Teifun2/cs-unifi-bouncer`,
-`developingchet/cs-unifi-bouncer-pro`) and finding neither a clean fit — one caused a
-real CPU-exhaustion incident on a previous deployment (traced to UniFi firewall-policy
-*reordering* on every decision change), the other has no external validation. This
-bouncer takes the good design ideas from both (a membership-only update model that never
-touches policy order) without either project's downsides. See the "How this differs"
-section below for why that specific design choice matters.
+Deliberately narrow in scope — see "How this differs" below for the design principle
+that shapes everything else in this README.
 
 Published to Docker Hub as [`nipar44/crowdsec-unifi-bouncer`](https://hub.docker.com/r/nipar44/crowdsec-unifi-bouncer)
 (`latest` + explicit `vX.Y.Z` tags read from the Dockerfile's own
 `org.opencontainers.image.version` label).
+
+## How this differs
+
+A common approach to this kind of bouncer manages UniFi firewall *policies* directly —
+creating, updating, or reordering the policy that actually enforces the block whenever
+the ban list changes. Reordering a policy set is a genuinely expensive operation on UDM
+Pro hardware (the router has to recompute and reload its ruleset), and doing it on
+nearly every change is a real, documented way to sustain high CPU load on the
+controller.
+
+This bouncer takes a structurally narrower approach: it never creates, edits, or
+reorders a firewall *policy*, not even once, not even at startup — only ever
+reads/writes one firewall *group*'s membership list, which is cheap regardless of how
+often it changes. The one-time policy setup covered below (including its own one-time
+reorder step, done by hand) is deliberately the only place a policy ever gets touched —
+never repeated by this code, for as long as it runs.
 
 ## Before you install: read this
 
@@ -124,8 +135,8 @@ Copy that ID. The group is still empty of consequence at this point — it has n
 referencing it, so nothing is blocked yet. That's expected.
 
 **4b. Create the policy**, referencing the group's real ID. This needs the v2
-zone-based-firewall API (not documented in UniFi's own public docs at all — this exact
-shape was reverse-engineered from `cs-unifi-bouncer-pro`'s source):
+zone-based-firewall API — not documented in UniFi's own public docs at all, determined
+through direct testing against a real controller:
 
 ```bash
 curl -k -X POST "https://<unifi-host>/proxy/network/v2/api/site/<site>/firewall-policies" \
@@ -210,16 +221,6 @@ real checks:
 - Defense-in-depth: refuses to ever add a Cloudflare IP range to the block list,
   regardless of what CrowdSec reports (checked against Cloudflare's own published
   ranges, both IPv4 and IPv6).
-
-## How this differs from the tools this was built after evaluating
-
-The tool that was previously deployed and caused a real CPU-exhaustion incident
-(`Teifun2/cs-unifi-bouncer`) reorders UniFi's *entire* zone-based policy set on nearly
-every ban-list change — a genuinely expensive whole-ruleset operation on UDM Pro
-hardware. This bouncer never creates, edits, or reorders a policy at all, not even
-once, not even at startup — only ever a group's membership. The one-time policy setup
-above (including its own one-time reorder call) is deliberately the *only* place a
-policy gets touched, done once by a human, never repeated by this code.
 
 ## This repo vs. a specific deployment
 
