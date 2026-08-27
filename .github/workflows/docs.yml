@@ -1,0 +1,37 @@
+name: Sync Docker Hub description
+
+# Deliberately its own workflow, not a step in build.yml -- a docs-only edit should
+# never trigger an image rebuild (and therefore never trigger another round of
+# automated pulls against a fresh digest), and an image rebuild shouldn't need to also
+# touch Docker Hub's description metadata. Reuses the same DOCKER_USER/DOCKER_TOKEN
+# secrets build.yml already uses to push images -- no new credentials needed.
+#
+# Deliberately does NOT sync the full README.md -- Docker Hub's description is a short
+# pointer to the real GitHub README, not a duplicate of it. The full installation guide
+# (incl. the required manual UniFi policy setup) only ever lives in one place.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dockerhub-description.md'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch: {}
+
+jobs:
+  sync-description:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Push short description + GitHub link to Docker Hub
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+          repository: nipar44/crowdsec-unifi-bouncer
+          short-description: "CrowdSec -> UniFi firewall bouncer. See GitHub README for required installation steps before deploying."
+          readme-filepath: ./dockerhub-description.md
